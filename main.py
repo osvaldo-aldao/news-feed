@@ -1,28 +1,52 @@
+import configparser
 import socket
 import threading
 import webbrowser
 import re
 from dataclasses import dataclass, field
 from io import BytesIO
+from pathlib import Path
 
 import customtkinter as ctk
 import feedparser
 import requests
 from PIL import Image
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+_cfg = configparser.ConfigParser()
+_cfg.read(Path(__file__).parent / "config.ini")
+
+def _c(section, key, fallback):
+    return _cfg.get(section, key, fallback=str(fallback))
+
+VISIBLE_CARDS        = int(_c("display",    "visible_cards",       6))
+WINDOW_WIDTH         = int(_c("display",    "window_width",        900))
+APPEARANCE           = _c("display",        "appearance",          "System")
+COLOR_THEME          = _c("display",        "color_theme",         "blue")
+AUTOSCROLL_INTERVAL  = int(_c("scrolling",  "card_interval_ms",    3000))
+AUTOSCROLL_PAUSE_TOP = int(_c("scrolling",  "pause_top_ms",        2000))
+DEFAULT_SOURCE       = _c("feeds",          "default_source",      "BBC News")
+DESCRIPTION_MAX_CHARS = int(_c("articles",  "description_max_chars", 220))
+IMAGE_SIZE = (
+    int(_c("articles", "thumbnail_width",  140)),
+    int(_c("articles", "thumbnail_height", 90)),
+)
+
+# Build RSS_FEEDS from [feeds] section, skipping the special key
+_RESERVED = {"default_source"}
+RSS_FEEDS = [
+    (name.title(), url.strip())
+    for name, url in _cfg.items("feeds")
+    if name not in _RESERVED
+] if _cfg.has_section("feeds") else []
+
 socket.setdefaulttimeout(10)
 
-ctk.set_appearance_mode("System")
-ctk.set_default_color_theme("blue")
-
-RSS_FEEDS = [
-    ("BBC News", "https://feeds.bbci.co.uk/news/rss.xml"),
-    ("Reuters", "https://feeds.reuters.com/reuters/topNews"),
-    ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
-]
-
-IMAGE_SIZE = (140, 90)
-DESCRIPTION_MAX_CHARS = 220
+ctk.set_appearance_mode(APPEARANCE)
+ctk.set_default_color_theme(COLOR_THEME)
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +92,14 @@ def extract_thumbnail(entry) -> str:
     m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', summary)
     if m:
         return m.group(1)
+    # 5. first <img> in content:encoded (used by The Verge, TechCrunch, etc.)
+    for content in getattr(entry, "content", []):
+        value = content.get("value", "")
+        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', value)
+        if m:
+            url = m.group(1)
+            if not url.startswith("data:"):  # skip base64 inline images
+                return url
     return ""
 
 
@@ -107,18 +139,25 @@ class ImageLoader:
     def placeholder(self) -> ctk.CTkImage:
         return self._placeholder
 
-    def get(self, url: str, callback) -> None:
-        if not url:
+    def get(self, url: str, callback, article_url: str = "") -> None:
+        cache_key = url or article_url
+        if not cache_key:
             return
-        if url in self._cache:
-            callback(self._cache[url])
+        if cache_key in self._cache:
+            callback(self._cache[cache_key])
             return
 
         def worker():
             try:
-                resp = requests.get(url, timeout=8, stream=True)
+                import warnings
+                img_url = url or self._fetch_og_image(article_url)
+                if not img_url:
+                    return
+                resp = requests.get(img_url, timeout=8, stream=True)
                 resp.raise_for_status()
-                img = Image.open(BytesIO(resp.content)).convert("RGB")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    img = Image.open(BytesIO(resp.content)).convert("RGB")
                 img.thumbnail(IMAGE_SIZE, Image.LANCZOS)
                 # pad to exact size
                 padded = Image.new("RGB", IMAGE_SIZE, (80, 80, 80))
@@ -126,13 +165,31 @@ class ImageLoader:
                 y = (IMAGE_SIZE[1] - img.height) // 2
                 padded.paste(img, (x, y))
                 ctk_img = ctk.CTkImage(light_image=padded, dark_image=padded, size=IMAGE_SIZE)
-                self._cache[url] = ctk_img
+                self._cache[cache_key] = ctk_img
                 self._root.after(0, lambda: callback(ctk_img))
             except Exception:
                 pass  # keep placeholder
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
+
+    def _fetch_og_image(self, article_url: str) -> str:
+        try:
+            resp = requests.get(article_url, timeout=6, stream=True)
+            resp.raise_for_status()
+            # Read only the first 8KB — enough to find <head> og:image
+            chunk = b""
+            for data in resp.iter_content(chunk_size=1024):
+                chunk += data
+                if len(chunk) >= 8192:
+                    break
+            html = chunk.decode("utf-8", errors="ignore")
+            m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
+            if not m:
+                m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html)
+            return m.group(1) if m else ""
+        except Exception:
+            return ""
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +239,8 @@ class NewsCardFrame(ctk.CTkFrame):
             desc_label.bind("<Enter>", self._on_enter)
             desc_label.bind("<Leave>", self._on_leave)
 
-        # Load real image
-        image_loader.get(item.thumbnail_url, self._set_image)
+        # Load real image, fall back to og:image from article page if no thumbnail
+        image_loader.get(item.thumbnail_url, self._set_image, article_url=item.url)
 
     def _set_image(self, img: ctk.CTkImage) -> None:
         self._img_label.configure(image=img)
@@ -216,19 +273,13 @@ class SidebarFrame(ctk.CTkFrame):
                      font=ctk.CTkFont(size=12), text_color="gray60").pack(padx=16, pady=(12, 4), anchor="w")
 
         for name, _url in feeds:
-            var = ctk.BooleanVar(value=True)
+            var = ctk.BooleanVar(value=(name == DEFAULT_SOURCE))
             self._checkboxes[name] = var
             ctk.CTkCheckBox(self, text=name, variable=var,
                             font=ctk.CTkFont(size=13)).pack(padx=16, pady=3, anchor="w")
 
         self._refresh_btn = ctk.CTkButton(self, text="Refresh", command=self._on_refresh)
         self._refresh_btn.pack(padx=16, pady=(20, 8), fill="x")
-
-        # Dark / light toggle
-        self._appearance_var = ctk.StringVar(value="System")
-        ctk.CTkOptionMenu(self, values=["System", "Light", "Dark"],
-                          variable=self._appearance_var,
-                          command=ctk.set_appearance_mode).pack(padx=16, pady=(0, 8), fill="x")
 
         self._status_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=11),
                                           text_color="gray60")
@@ -249,16 +300,21 @@ class SidebarFrame(ctk.CTkFrame):
 # Main app
 # ---------------------------------------------------------------------------
 
+
+
 class NewsApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("News Feed")
-        self.geometry("900x700")
-        self.minsize(700, 500)
+        self.geometry(f"{WINDOW_WIDTH}x700")
+        self.minsize(700, 400)
 
         self._feed_manager = FeedManager()
         self._image_loader = ImageLoader(self)
         self._fetch_generation = 0
+        self._autoscroll_paused = False
+        self._autoscroll_job = None
+        self._autoscroll_index = 0
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -269,6 +325,10 @@ class NewsApp(ctk.CTk):
         self._scroll_frame = ctk.CTkScrollableFrame(self, corner_radius=0)
         self._scroll_frame.grid(row=0, column=1, sticky="nsew")
         self._scroll_frame.grid_columnconfigure(0, weight=1)
+
+        # Pause auto-scroll when mouse is over the feed
+        self._scroll_frame.bind("<Enter>", lambda _: self._set_paused(True))
+        self._scroll_frame.bind("<Leave>", lambda _: self._set_paused(False))
 
         self.after(100, self._start_refresh)
 
@@ -289,6 +349,7 @@ class NewsApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _clear_cards(self) -> None:
+        self._stop_autoscroll()
         for widget in self._scroll_frame.winfo_children():
             widget.destroy()
 
@@ -303,6 +364,61 @@ class NewsApp(ctk.CTk):
             card = NewsCardFrame(self._scroll_frame, item, self._image_loader)
             card.grid(sticky="ew", padx=10, pady=5)
             self._scroll_frame.grid_columnconfigure(0, weight=1)
+
+        self.after(300, self._fit_to_six_cards)
+        self.after(500, self._start_autoscroll)
+
+    def _fit_to_six_cards(self) -> None:
+        cards = self._scroll_frame.winfo_children()
+        if not cards:
+            return
+        # Measure height of first N cards including their gaps
+        n = min(VISIBLE_CARDS, len(cards))
+        content_height = sum(c.winfo_height() + 10 for c in cards[:n])  # 10 = pady 5+5
+        # Add window chrome: title bar + sidebar top padding
+        target = content_height + 40
+        self.geometry(f"{self.winfo_width()}x{target}")
+
+    def _set_paused(self, paused: bool) -> None:
+        self._autoscroll_paused = paused
+
+    def _stop_autoscroll(self) -> None:
+        if self._autoscroll_job is not None:
+            self.after_cancel(self._autoscroll_job)
+            self._autoscroll_job = None
+
+    def _start_autoscroll(self) -> None:
+        self._stop_autoscroll()
+        self._autoscroll_index = 0
+        self._scroll_frame._parent_canvas.yview_moveto(0)
+        self._autoscroll_job = self.after(AUTOSCROLL_INTERVAL, self._autoscroll_tick)
+
+    def _autoscroll_tick(self) -> None:
+        if self._autoscroll_paused:
+            self._autoscroll_job = self.after(AUTOSCROLL_INTERVAL, self._autoscroll_tick)
+            return
+
+        cards = self._scroll_frame.winfo_children()
+        if not cards:
+            return
+
+        self._autoscroll_index += 1
+
+        if self._autoscroll_index >= len(cards):
+            # Reached the last card — go back to top
+            self._autoscroll_index = 0
+            self._scroll_frame._parent_canvas.yview_moveto(0)
+            self._autoscroll_job = self.after(AUTOSCROLL_PAUSE_TOP, self._autoscroll_tick)
+            return
+
+        # Scroll so the next card is at the top of the viewport
+        canvas = self._scroll_frame._parent_canvas
+        card = cards[self._autoscroll_index]
+        bbox = canvas.bbox("all")
+        scroll_height = bbox[3] if bbox else canvas.winfo_reqheight()
+        card_y = card.winfo_y()
+        canvas.yview_moveto(card_y / scroll_height)
+        self._autoscroll_job = self.after(AUTOSCROLL_INTERVAL, self._autoscroll_tick)
 
 
 if __name__ == "__main__":
