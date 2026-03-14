@@ -26,8 +26,16 @@ VISIBLE_CARDS        = int(_c("display",    "visible_cards",       6))
 WINDOW_WIDTH         = int(_c("display",    "window_width",        900))
 APPEARANCE           = _c("display",        "appearance",          "System")
 COLOR_THEME          = _c("display",        "color_theme",         "blue")
+BACKGROUND_COLOR     = _c("display",        "background_color",    "")
 AUTOSCROLL_INTERVAL  = int(_c("scrolling",  "card_interval_ms",    3000))
 AUTOSCROLL_PAUSE_TOP = int(_c("scrolling",  "pause_top_ms",        2000))
+SPEED_STEP_MS        = int(_c("scrolling",  "speed_step_ms",        500))
+SPEED_MIN_MS         = int(_c("scrolling",  "speed_min_ms",         500))
+SPEED_MAX_MS         = int(_c("scrolling",  "speed_max_ms",       10000))
+SPEED_FASTER_KEY     = _c("scrolling",      "speed_faster_key",   "plus")
+SPEED_SLOWER_KEY     = _c("scrolling",      "speed_slower_key",  "minus")
+PREV_CARD_KEY        = _c("scrolling",      "prev_card_key",        "Up")
+NEXT_CARD_KEY        = _c("scrolling",      "next_card_key",      "Down")
 DEFAULT_SOURCE       = _c("feeds",          "default_source",      "BBC News")
 DESCRIPTION_MAX_CHARS = int(_c("articles",  "description_max_chars", 220))
 IMAGE_SIZE = (
@@ -315,6 +323,14 @@ class NewsApp(ctk.CTk):
         self._autoscroll_paused = False
         self._autoscroll_job = None
         self._autoscroll_index = 0
+        self._card_interval = AUTOSCROLL_INTERVAL
+
+        self.bind(f"<{SPEED_FASTER_KEY}>", lambda _: self._change_speed(-SPEED_STEP_MS))
+        self.bind(f"<{SPEED_SLOWER_KEY}>", lambda _: self._change_speed(+SPEED_STEP_MS))
+        self.bind("<KP_Add>",      lambda _: self._change_speed(-SPEED_STEP_MS))
+        self.bind("<KP_Subtract>", lambda _: self._change_speed(+SPEED_STEP_MS))
+        self.bind(f"<{PREV_CARD_KEY}>", lambda _: self._jump_card(-1))
+        self.bind(f"<{NEXT_CARD_KEY}>", lambda _: self._jump_card(+1))
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -322,7 +338,11 @@ class NewsApp(ctk.CTk):
         self._sidebar = SidebarFrame(self, RSS_FEEDS, on_refresh=self._start_refresh)
         self._sidebar.grid(row=0, column=0, sticky="nsew")
 
-        self._scroll_frame = ctk.CTkScrollableFrame(self, corner_radius=0)
+        bg = BACKGROUND_COLOR if BACKGROUND_COLOR else None
+        if bg:
+            self.configure(fg_color=bg)
+        self._scroll_frame = ctk.CTkScrollableFrame(self, corner_radius=0,
+                                                    fg_color=bg if bg else ("gray95", "gray10"))
         self._scroll_frame.grid(row=0, column=1, sticky="nsew")
         self._scroll_frame.grid_columnconfigure(0, weight=1)
 
@@ -387,15 +407,32 @@ class NewsApp(ctk.CTk):
             self.after_cancel(self._autoscroll_job)
             self._autoscroll_job = None
 
+    def _jump_card(self, direction: int) -> None:
+        cards = self._scroll_frame.winfo_children()
+        if not cards:
+            return
+        self._autoscroll_index = max(0, min(len(cards) - 1, self._autoscroll_index + direction))
+        canvas = self._scroll_frame._parent_canvas
+        bbox = canvas.bbox("all")
+        scroll_height = bbox[3] if bbox else canvas.winfo_reqheight()
+        canvas.yview_moveto(cards[self._autoscroll_index].winfo_y() / scroll_height)
+        # Reset the auto-scroll timer
+        self._stop_autoscroll()
+        self._autoscroll_job = self.after(self._card_interval, self._autoscroll_tick)
+
+    def _change_speed(self, delta_ms: int) -> None:
+        self._card_interval = max(SPEED_MIN_MS, min(SPEED_MAX_MS, self._card_interval + delta_ms))
+        self._sidebar.set_status(f"Speed: {self._card_interval // 1000}.{(self._card_interval % 1000) // 100}s per card")
+
     def _start_autoscroll(self) -> None:
         self._stop_autoscroll()
         self._autoscroll_index = 0
         self._scroll_frame._parent_canvas.yview_moveto(0)
-        self._autoscroll_job = self.after(AUTOSCROLL_INTERVAL, self._autoscroll_tick)
+        self._autoscroll_job = self.after(self._card_interval, self._autoscroll_tick)
 
     def _autoscroll_tick(self) -> None:
         if self._autoscroll_paused:
-            self._autoscroll_job = self.after(AUTOSCROLL_INTERVAL, self._autoscroll_tick)
+            self._autoscroll_job = self.after(self._card_interval, self._autoscroll_tick)
             return
 
         cards = self._scroll_frame.winfo_children()
@@ -418,7 +455,7 @@ class NewsApp(ctk.CTk):
         scroll_height = bbox[3] if bbox else canvas.winfo_reqheight()
         card_y = card.winfo_y()
         canvas.yview_moveto(card_y / scroll_height)
-        self._autoscroll_job = self.after(AUTOSCROLL_INTERVAL, self._autoscroll_tick)
+        self._autoscroll_job = self.after(self._card_interval, self._autoscroll_tick)
 
 
 if __name__ == "__main__":
